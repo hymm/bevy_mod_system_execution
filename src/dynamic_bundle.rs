@@ -58,7 +58,7 @@ impl DynamicBundle {
     pub fn with_capacity(size: usize) -> DynamicBundle {
         // Safety: Layout is non zero sized.
         let ptr = unsafe { alloc(Layout::from_size_align(size, 1).unwrap()) };
-        assert!(ptr != std::ptr::null_mut());
+        assert!(!ptr.is_null());
         DynamicBundle {
             // Safety: alloc only returns null if the allocation fails
             data: unsafe { NonNull::new_unchecked(ptr) },
@@ -144,7 +144,7 @@ impl DynamicBundle {
             Layout::from_size_align(new_min_capacity.next_power_of_two().max(64), align).unwrap();
         // SAFETY: max check above will always return a nonzero size
         let new_ptr = unsafe { alloc(layout) };
-        assert!(new_ptr != std::ptr::null_mut(), "allocation failed");
+        assert!(!new_ptr.is_null(), "allocation failed");
         // SAFETY: asserted that the ptr was not null above
         let new_ptr = unsafe { NonNull::new_unchecked(new_ptr) };
         if old_layout.size() > 0 {
@@ -186,12 +186,32 @@ impl DynamicBundle {
 
     /// Returns an iterator over OwningPtr's that can be used to insert the data into the world
     pub fn consume(&mut self) -> impl Iterator<Item = OwningPtr<'_>> {
-        // TODO: this method should probably be unsafe
-        // TODO: should reset the memory?
+        // TODO: should this reset the memory after finishing iteration?
 
         self.info.iter().map(|(_desc, offset)| {
+            // SAFETY: we allocated the memory earlier, so add will always be non null and in the range
+            // of the allocation
             let ptr = unsafe { self.data.add(*offset) };
+
+            // - `inner` points to correct type
+            // - type is aligned as that is how it was allocated
+            // - `inner` is an owned value, so we have provenance to read and write.
+            // - The lifetime of the owning is constrained to self, so will be valid for that lifetime
             unsafe { OwningPtr::new(ptr) }
+        })
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Option<TypeId>, NonNull<u8>)> {
+        self.info.iter().map(|(desc, offset)| {
+            // SAFETY: we allocated the memory earlier, so add will always be non null and in the range
+            // of the allocation
+            let ptr = unsafe { self.data.add(*offset) };
+
+            // - `inner` points to correct type
+            // - type is aligned as that is how it was allocated
+            // - `inner` is an owned value, so we have provenance to read and write.
+            // - The lifetime of the owning is constrained to self, so will be valid for that lifetime
+            (desc.type_id, ptr)
         })
     }
 
