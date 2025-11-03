@@ -252,7 +252,7 @@ where
 mod tests {
     use bevy::ecs::{
         schedule::Schedule,
-        system::{Commands, Local, Res, ResMut},
+        system::{Commands, InMut, Local, NonSendMarker, Res, ResMut},
     };
 
     use super::*;
@@ -313,7 +313,23 @@ mod tests {
 
     #[test]
     fn can_pass_in_lifetimed_input() {
-        todo!()
+        fn system_1(InMut(count): InMut<usize>) {
+            *count += 1;
+        }
+        let mut world = World::new();
+        let mut builder = SystemRunnerBuilder::<MySystems>::new(&mut world);
+        builder.add_system(system_1);
+        builder.build();
+
+        fn runner_system(mut system_runner: SystemRunner<MySystems>) {
+            let mut count = 0;
+            system_runner.run_system_with(system_1, &mut count).unwrap();
+            assert_eq!(count, 1);
+        }
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(runner_system);
+        schedule.run(&mut world);
     }
 
     #[test]
@@ -371,6 +387,7 @@ mod tests {
         system.initialize(&mut world);
         system.run((), &mut world).unwrap();
         assert!(world.get_resource::<TestResource>().is_some());
+        assert!(system.has_deferred());
     }
 
     #[test]
@@ -407,14 +424,27 @@ mod tests {
         system.initialize(&mut world);
     }
 
+    #[ignore = "bevy doesn't support setting exclusive in system meta"]
     #[test]
     fn registers_as_exclusive() {
         todo!();
     }
 
     #[test]
-    fn registers_as_non_send() {}
+    fn registers_as_non_send() {
+        fn system_1(_marker: NonSendMarker) {}
 
-    #[test]
-    fn registers_as_has_deferred() {}
+        let mut world = World::new();
+        let mut builder = SystemRunnerBuilder::<MySystems>::new(&mut world);
+        builder.add_system(system_1);
+        builder.build();
+
+        fn runner_system(mut system_runner: SystemRunner<MySystems>) {
+            system_runner.run_system(system_1).unwrap();
+        }
+
+        let mut system = IntoSystem::into_system(runner_system);
+        system.initialize(&mut world);
+        assert!(!system.is_send());
+    }
 }
