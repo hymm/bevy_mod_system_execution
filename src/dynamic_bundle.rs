@@ -73,7 +73,7 @@ impl DynamicBundle {
         self.layout.size()
     }
 
-    /// Clear the DynmaicBuffer. This allows the allocation to be reused.
+    /// Clear the `DynmaicBuffer`. This allows the allocation to be reused.
     pub fn clear(&mut self) {
         self.indices.clear();
         self.info.clear();
@@ -170,6 +170,19 @@ impl DynamicBundle {
 
     /// Get a reference to a value that was previously stored
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        // Safety: this method requires exclusive access to self
+        unsafe { self.get_mut_unchecked::<T>() }
+    }
+
+    /// Get a reference to mutable reference to a stored value
+    ///
+    /// # Safety
+    /// - Do not get mutable references to the same data more than once
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "This is safe since we're in control of the underlying memory and the above safety"
+    )]
+    pub unsafe fn get_mut_unchecked<T: 'static>(&self) -> Option<&mut T> {
         let type_id = TypeId::of::<T>();
         let index = self.indices.get(&type_id)?;
         let (_, offset) = self.info[*index];
@@ -236,7 +249,6 @@ impl Default for DynamicBundle {
 impl Drop for DynamicBundle {
     fn drop(&mut self) {
         if self.layout.size() > 0 {
-            // TODO: we need to call the drop impl's of the stored values.
             for (desc, offset) in &mut self.info {
                 let ptr = unsafe { self.data.add(*offset) };
                 let Some(drop) = desc.drop else {

@@ -5,10 +5,12 @@ use bevy::{
         query::FilteredAccessSet,
         resource::Resource,
         system::{IntoSystem, ResMut, RunSystemError, System, SystemInput, SystemParam},
-        world::{DeferredWorld, Mut, World, unsafe_world_cell::UnsafeWorldCell},
+        world::{Mut, World, unsafe_world_cell::UnsafeWorldCell},
     },
     platform::collections::HashMap,
+    tasks::{ComputeTaskPool, futures_lite::stream::Filter},
 };
+use static_assertions::assert_type_ne_all;
 
 use crate::dynamic_bundle::DynamicBundle;
 
@@ -19,7 +21,6 @@ pub struct SystemRunnerBuilder<'w, Marker: Send + Sync + 'static> {
     is_exclusive: bool,
     has_deferred: bool,
     apply_deffereds: HashMap<TypeId, unsafe fn(NonNull<u8>, &mut World)>,
-    queue_deffereds: HashMap<TypeId, unsafe fn(NonNull<u8>, DeferredWorld)>,
     total_access: FilteredAccessSet,
     systems: DynamicBundle,
     phantom_data: PhantomData<Marker>,
@@ -34,7 +35,6 @@ impl<'w, Marker: Send + Sync + 'static> SystemRunnerBuilder<'w, Marker> {
             is_exclusive: false,
             has_deferred: false,
             apply_deffereds: HashMap::new(),
-            queue_deffereds: HashMap::new(),
             total_access: FilteredAccessSet::default(),
             systems: DynamicBundle::with_capacity(0),
             phantom_data: PhantomData,
@@ -64,8 +64,6 @@ impl<'w, Marker: Send + Sync + 'static> SystemRunnerBuilder<'w, Marker> {
         self.accesses.insert(type_id, access);
         self.apply_deffereds
             .insert(type_id, <S::System as ApplyBuffers>::apply_deferred);
-        self.queue_deffereds
-            .insert(type_id, <S::System as ApplyBuffers>::queue_deferred);
     }
 
     pub fn build(self) {
@@ -74,8 +72,7 @@ impl<'w, Marker: Send + Sync + 'static> SystemRunnerBuilder<'w, Marker> {
             is_exclusive: self.is_exclusive,
             has_deferred: self.has_deferred,
             accesses: self.accesses,
-            apply_deffereds: self.apply_deffereds,
-            queue_deffereds: self.queue_deffereds,
+            apply_deferreds: self.apply_deffereds,
             systems: self.systems,
             total_access: self.total_access,
             phantom_data: PhantomData::<Marker>,
@@ -89,8 +86,7 @@ pub struct SystemRunnerResource<Marker: Send + Sync + 'static> {
     is_exclusive: bool,
     has_deferred: bool,
     accesses: HashMap<TypeId, FilteredAccessSet>,
-    apply_deffereds: HashMap<TypeId, unsafe fn(NonNull<u8>, &mut World)>,
-    queue_deffereds: HashMap<TypeId, unsafe fn(NonNull<u8>, DeferredWorld)>,
+    apply_deferreds: HashMap<TypeId, unsafe fn(NonNull<u8>, &mut World)>,
     systems: DynamicBundle,
     total_access: FilteredAccessSet,
     phantom_data: PhantomData<Marker>,
@@ -98,6 +94,7 @@ pub struct SystemRunnerResource<Marker: Send + Sync + 'static> {
 
 pub struct SystemRunner<'w, Marker: Send + Sync + 'static> {
     world: UnsafeWorldCell<'w>,
+    accesses: &'w HashMap<TypeId, FilteredAccessSet>,
     systems: &'w mut DynamicBundle,
     phantom_data: PhantomData<Marker>,
 }
@@ -155,6 +152,7 @@ unsafe impl<Marker: Send + Sync + 'static> SystemParam for SystemRunner<'_, Mark
 
         SystemRunner {
             world,
+            accesses: &resource.accesses,
             systems: &mut resource.systems,
             phantom_data: PhantomData,
         }
@@ -168,7 +166,7 @@ unsafe impl<Marker: Send + Sync + 'static> SystemParam for SystemRunner<'_, Mark
         world.resource_scope(|world, mut resource: Mut<SystemRunnerResource<Marker>>| {
             let SystemRunnerResource {
                 ref mut systems,
-                ref apply_deffereds,
+                apply_deferreds: ref apply_deffereds,
                 ..
             } = *resource;
             for (type_id, ptr) in systems.iter_mut() {
@@ -181,9 +179,9 @@ unsafe impl<Marker: Send + Sync + 'static> SystemParam for SystemRunner<'_, Mark
     }
 
     fn queue(
-        state: &mut Self::State,
-        system_meta: &bevy::ecs::system::SystemMeta,
-        world: bevy::ecs::world::DeferredWorld,
+        _state: &mut Self::State,
+        _system_meta: &bevy::ecs::system::SystemMeta,
+        _world: bevy::ecs::world::DeferredWorld,
     ) {
         // not possible to implement safely due to needing mutable access to the SystemRunnerResource
         unimplemented!("Cannot use SystemRunner with observers");
@@ -205,8 +203,16 @@ impl<'w, Marker: Send + Sync + 'static> SystemRunner<'w, Marker> {
         let system = self.systems.get_mut::<S::System>().unwrap();
         // Safety:
         // - the accesses needed to run this system were registered by SystemRunner
-
         unsafe { system.run_unsafe(input, self.world) }
+    }
+
+    fn get_access<I, O, M, S>(&self, _system: S) -> Option<&FilteredAccessSet>
+    where
+        I: SystemInput,
+        S: IntoSystem<I, O, M>,
+    {
+        let type_id = TypeId::of::<S::System>();
+        self.accesses.get(&type_id)
     }
 
     #[inline]
@@ -216,11 +222,70 @@ impl<'w, Marker: Send + Sync + 'static> SystemRunner<'w, Marker> {
     {
         self.run_system_with(system, ())
     }
+
+    /// Runs the two systems in parallel if the `ComputeTaskPool` can steal the task. But could potentially
+    /// run in series if the system runs too fast or other threads are occupied.
+    pub fn fork<I1, O1, M1, S1, I2, O2, M2, S2>(
+        &mut self,
+        system_1: S1,
+        input_1: <I1 as SystemInput>::Inner<'_>,
+        system_2: S2,
+        input_2: <I2 as SystemInput>::Inner<'_>,
+    ) -> Result<(O1, O2), RunSystemError>
+    where
+        I1: SystemInput,
+        S1: IntoSystem<I1, O1, M1> + 'static,
+        I2: SystemInput + Send,
+        for<'a> I2::Inner<'a>: Send,
+        S2: IntoSystem<I2, O2, M2> + 'static,
+        O1: Send + Sync + 'static,
+        O2: Send + Sync + 'static,
+    {
+        if !self
+            .get_access(system_1)
+            .unwrap()
+            .is_compatible(self.get_access(system_2).unwrap())
+        {
+            panic!("Access is not compatible between systems");
+        }
+
+        // TODO: if negative bounds are implemented then move this check to a compile time check
+        if TypeId::of::<S1::System>() == TypeId::of::<S2::System>() {
+            // This is a problem because there would be two mutable references to the system state
+            panic!("cannot run the same system in parallel with itself");
+        }
+
+        let system_1 = unsafe { self.systems.get_mut_unchecked::<S1::System>().unwrap() };
+        let system_2 = unsafe { self.systems.get_mut_unchecked::<S2::System>().unwrap() };
+
+        let mut result1 = Err("not initialized".into());
+        let mut result2 = ComputeTaskPool::get().scope(|scope| {
+            scope.spawn(async {
+                // Safety: we checked the compatibility with system_1 above and
+                // the system runner registered the access for the system earlier
+                unsafe { system_2.run_unsafe(input_2, self.world) }
+            });
+
+            // Safety: we checked the compatibility with system_1 above and
+            // the system runner registered the access for the system earlier
+            result1 = unsafe { system_1.run_unsafe(input_1, self.world) };
+        });
+
+        let Ok(result1) = result1 else {
+            return Err(result1.err().unwrap());
+        };
+
+        let result2 = result2.pop();
+        let Some(Ok(result2)) = result2 else {
+            return Err(result2.unwrap().err().unwrap());
+        };
+
+        Ok((result1, result2))
+    }
 }
 
 trait ApplyBuffers {
     unsafe fn apply_deferred(ptr: NonNull<u8>, world: &mut World);
-    unsafe fn queue_deferred(ptr: NonNull<u8>, world: DeferredWorld);
 }
 
 impl<S> ApplyBuffers for S
@@ -234,16 +299,6 @@ where
         // Safety: upheld by the caller
         unsafe {
             System::apply_deferred(ptr.as_mut(), world);
-        }
-    }
-
-    // Safety
-    // - `ptr` is a valid pointer to `S`
-    unsafe fn queue_deferred(ptr: NonNull<u8>, world: DeferredWorld) {
-        let mut ptr = ptr.cast::<S>();
-        // Safety: upheld by the caller
-        unsafe {
-            System::queue_deferred(ptr.as_mut(), world);
         }
     }
 }
