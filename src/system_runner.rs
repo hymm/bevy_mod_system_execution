@@ -8,9 +8,8 @@ use bevy::{
         world::{Mut, World, unsafe_world_cell::UnsafeWorldCell},
     },
     platform::collections::HashMap,
-    tasks::{ComputeTaskPool, futures_lite::stream::Filter},
+    tasks::ComputeTaskPool,
 };
-use static_assertions::assert_type_ne_all;
 
 use crate::dynamic_bundle::DynamicBundle;
 
@@ -305,9 +304,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use bevy::ecs::{
-        schedule::Schedule,
-        system::{Commands, InMut, Local, NonSendMarker, Res, ResMut},
+    use bevy::{
+        ecs::{
+            schedule::Schedule,
+            system::{Commands, InMut, Local, NonSendMarker, Res, ResMut},
+        },
+        tasks::TaskPool,
     };
 
     use super::*;
@@ -501,5 +503,58 @@ mod tests {
         let mut system = IntoSystem::into_system(runner_system);
         system.initialize(&mut world);
         assert!(!system.is_send());
+    }
+
+    #[test]
+    fn fork_two_systems() {
+        fn system_1() -> usize {
+            5
+        }
+        fn system_2(mut r: ResMut<TestResource>) -> usize {
+            r.0.pop().unwrap()
+        }
+        let mut world = World::new();
+        world.insert_resource(TestResource(vec![2]));
+        let mut builder = SystemRunnerBuilder::<MySystems>::new(&mut world);
+        builder.add_system(system_1);
+        builder.add_system(system_2);
+        builder.build();
+
+        fn runner_system(mut system_runner: SystemRunner<MySystems>) -> usize {
+            let (a, b) = system_runner.fork(system_1, (), system_2, ()).unwrap();
+            a + b
+        }
+
+        ComputeTaskPool::get_or_init(TaskPool::default);
+        let mut system = IntoSystem::into_system(runner_system);
+        system.initialize(&mut world);
+        let result = system.run((), &mut world).unwrap();
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "Access is not compatible")]
+    fn forking_conflicting_systems_panics() {
+        fn system_1(mut r: ResMut<TestResource>) -> usize {
+            r.0.pop().unwrap()
+        }
+        fn system_2(mut r: ResMut<TestResource>) -> usize {
+            r.0.pop().unwrap()
+        }
+        let mut world = World::new();
+        world.insert_resource(TestResource(vec![2]));
+        let mut builder = SystemRunnerBuilder::<MySystems>::new(&mut world);
+        builder.add_system(system_1);
+        builder.add_system(system_2);
+        builder.build();
+
+        fn runner_system(mut system_runner: SystemRunner<MySystems>) -> usize {
+            let (a, b) = system_runner.fork(system_1, (), system_2, ()).unwrap();
+            a + b
+        }
+
+        let mut system = IntoSystem::into_system(runner_system);
+        system.initialize(&mut world);
+        system.run((), &mut world).unwrap();
     }
 }
